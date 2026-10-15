@@ -2,50 +2,70 @@ name: Build Push Deploy to ACI
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: web-demo
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-
     steps:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Azure Login
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to Azure
       uses: azure/login@v1
       with:
         creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-    - name: Build and Push Image
+    - name: Validate required secrets
+      run: |
+        if [ -z "${{ secrets.AZURE_RESOURCE_GROUP }}" ] || [ -z "${{ secrets.ACR_NAME }}" ]; then
+          echo "ERROR: Required secrets AZURE_RESOURCE_GROUP or ACR_NAME are missing."
+          exit 1
+        fi
+
+    - name: ACR login
+      run: az acr login -n ${{ secrets.ACR_NAME }}
+
+    - name: Build and push image
       run: |
         ACR_LOGIN=$(az acr show -n ${{ secrets.ACR_NAME }} -g ${{ secrets.AZURE_RESOURCE_GROUP }} --query loginServer -o tsv)
-        IMAGE_TAG=$ACR_LOGIN/web-demo:${GITHUB_SHA::8}
+        IMAGE_TAG=${ACR_LOGIN}/${{ env.IMAGE_NAME }}:${GITHUB_SHA::8}
         docker build -t $IMAGE_TAG ./app
-        az acr login -n ${{ secrets.ACR_NAME }}
         docker push $IMAGE_TAG
         echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
 
-    - name: Deploy to ACI
+    - name: Deploy to ACI (create or update)
+      env:
+        RG: ${{ secrets.AZURE_RESOURCE_GROUP }}
+        ACR_NAME: ${{ secrets.ACR_NAME }}
       run: |
-        ACR_LOGIN=$(az acr show -n ${{ secrets.ACR_NAME }} -g ${{ secrets.AZURE_RESOURCE_GROUP }} --query loginServer -o tsv)
-        if az container show -g ${{ secrets.AZURE_RESOURCE_GROUP }} -n web-demo-aci &>/dev/null; then
-          az container delete -g ${{ secrets.AZURE_RESOURCE_GROUP }} -n web-demo-aci --yes
+        ACR_LOGIN=$(az acr show -n $ACR_NAME -g $RG --query loginServer -o tsv)
+        REG_USER=$(az acr credential show -n $ACR_NAME -g $RG --query "username" -o tsv)
+        REG_PASS=$(az acr credential show -n $ACR_NAME -g $RG --query "passwords[0].value" -o tsv)
+
+        if az container show -g $RG -n web-demo-aci &>/dev/null; then
+          az container delete -g $RG -n web-demo-aci --yes
         fi
+
         az container create \
-          -g ${{ secrets.AZURE_RESOURCE_GROUP }} \
+          -g $RG \
           -n web-demo-aci \
-          --image $IMAGE_TAG \
+          --image ${{ env.IMAGE_TAG }} \
           --os-type Linux \
           --cpu 1 \
           --memory 1.5 \
-          --dns-name-label webdemo-prod \
+          --dns-name-label webdemo${{ github.run_id }} \
           --ports 80 \
           --registry-login-server $ACR_LOGIN \
-          --assign-identity \
+          --registry-username $REG_USER \
+          --registry-password $REG_PASS \
           --restart-policy Always
 
-    - name: Show FQDN
-      run: |
-        az container show -g ${{ secrets.AZURE_RESOURCE_GROUP }} -n web-demo-aci --query "ipAddress.fqdn" -o tsv
+        az container show -g $RG -n web-demo-aci --query "{FQDN:ipAddress.fqdn}" -o tsv
